@@ -9,7 +9,7 @@ export function validatePosts(posts) {
     if (!p || !/^[a-zA-Z0-9-]+$/.test(p.id) || ids.has(p.id) ||
         typeof p.title !== 'string' || !p.title.trim() || p.title.length > 100 ||
         typeof p.text !== 'string' || p.text.length > 20000 ||
-        !/^\d{4}-\d{2}-\d{2}$/.test(p.date) || !p.text.trim()) throw new Error('文章内容不完整或超出限制。');
+        !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(p.date) || !p.text.trim()) throw new Error('文章内容不完整或超出限制。');
     ids.add(p.id);
   }
   return posts;
@@ -40,7 +40,7 @@ export function renderPost(p) {
   const article = node('details', 'post'); article.id = `post-${p.id}`;
   const summary = node('summary');
   const meta = node('span', 'post-meta');
-  const date = node('time', '', p.date.replaceAll('-', '.')); date.dateTime = p.date;
+  const date = node('time', '', p.date.replace('T', ' ').replaceAll('-', '.')); date.dateTime = p.date;
   meta.append(date, node('span', '', '记录'));
   const blocks = contentBlocks(p.text);
   summary.append(meta, node('span', 'post-heading', p.title), node('span', 'post-excerpt', blocks.filter(b => b.type === 'text').map(b => b.text).join(' ').trim().slice(0, 90)), node('span', 'post-bottom read-label', '展开阅读全文'));
@@ -68,7 +68,7 @@ if (list) {
     const archive = document.querySelector('#archive-list');
     if (posts.length) {
       archive.replaceChildren(...posts.map(p => {
-        const link = node('a', '', `${p.date} · ${p.title}`); link.href = `#post-${p.id}`;
+        const link = node('a', '', `${p.date.replace('T', ' ')} · ${p.title}`); link.href = `#post-${p.id}`;
         link.addEventListener('click', () => { document.getElementById(`post-${p.id}`).open = true; }); return link;
       }));
       const target = document.getElementById(location.hash.slice(1));

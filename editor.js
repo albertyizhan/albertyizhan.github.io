@@ -1,6 +1,7 @@
 import {OWNER, REPO, BRANCH, MAX_BYTES, validatePosts, node, renderPost} from './blog.js';
 const $ = id => document.getElementById(id);
 let token = '', draftId = crypto.randomUUID(), busy = false, dirty = false;
+const TOKEN_CACHE = 'liubai-author-token';
 const endpoint = `https://api.github.com/repos/${OWNER}/${REPO}`;
 const status = message => { $('status').textContent = message; };
 function controls() {
@@ -8,10 +9,12 @@ function controls() {
   for (const id of ['login-button', 'token', 'logout']) $(id).disabled = busy;
   $('logout').hidden = !token;
 }
+function cacheToken() { try { sessionStorage.setItem(TOKEN_CACHE, token); } catch {} }
+function clearCachedToken() { try { sessionStorage.removeItem(TOKEN_CACHE); } catch {} }
 async function api(url, options = {}) {
   const response = await fetch(url, {...options, headers: {Accept: 'application/vnd.github+json', Authorization: `Bearer ${token}`, 'X-GitHub-Api-Version': '2022-11-28', ...options.headers}, signal: AbortSignal.timeout(30000)});
   if (!response.ok) {
-    if (response.status === 401) { token = ''; controls(); }
+    if (response.status === 401) { token = ''; clearCachedToken(); controls(); }
     throw new Error(response.status === 409 || response.status === 422 ? '文章库已变化，请再次发布；不会覆盖其他更新。' : `GitHub 请求失败（${response.status}），请检查令牌有效期、仓库权限及网络。`);
   }
   return response.json();
@@ -23,14 +26,44 @@ $('login-form').addEventListener('submit', async event => {
     if (user.login.toLowerCase() !== OWNER.toLowerCase()) throw new Error('仅允许 Albert 的 GitHub 账户发布。');
     const repo = await api(endpoint);
     if (!repo.permissions?.push) throw new Error('此凭证没有本站仓库的写入权限。');
-    $('logout').hidden = false; status('身份已验证，可以发布你的记录。');
-  } catch (error) { token = ''; status(error.message); }
+    cacheToken(); $('logout').hidden = false; status('身份已验证，可以发布你的记录。');
+    await refreshPosts();
+  } catch (error) { token = ''; clearCachedToken(); status(error.message); }
   finally { busy = false; controls(); $('login-button').disabled = false; }
 });
-$('logout').addEventListener('click', () => { token = ''; $('token').value = ''; $('logout').hidden = true; controls(); status('已退出，当前文字仍保留。'); });
+async function refreshPosts() {
+  const file = await api(`${endpoint}/contents/posts.json?ref=${encodeURIComponent(BRANCH)}`);
+  const bytes = Uint8Array.from(atob(file.content.replace(/\s/g, '')), c => c.charCodeAt(0));
+  const posts = validatePosts(JSON.parse(new TextDecoder('utf-8', {fatal: true}).decode(bytes)));
+  const manage = $('manage-posts'); manage.hidden = false; manage.replaceChildren();
+  if (!posts.length) { manage.append(node('p', 'field-note', '暂无已发布文章。')); return; }
+  for (const post of posts) {
+    const row = node('div', 'manage-post');
+    row.append(node('span', '', `${post.date.replace('T', ' ')} · ${post.title}`));
+    const button = node('button', 'delete-post', '删除'); button.type = 'button';
+    button.addEventListener('click', () => deletePost(post.id, post.title)); row.append(button); manage.append(row);
+  }
+}
+async function deletePost(id, title) {
+  if (busy || !confirm(`确定删除《${title}》吗？此操作会提交到 GitHub。`)) return;
+  busy = true; controls(); status('正在删除文章……');
+  try {
+    const file = await api(`${endpoint}/contents/posts.json?ref=${encodeURIComponent(BRANCH)}`);
+    const bytes = Uint8Array.from(atob(file.content.replace(/\s/g, '')), c => c.charCodeAt(0));
+    const posts = validatePosts(JSON.parse(new TextDecoder('utf-8', {fatal: true}).decode(bytes)));
+    const next = posts.filter(post => post.id !== id);
+    if (next.length === posts.length) throw new Error('文章已被删除或文章库已变化。');
+    const encoded = new TextEncoder().encode(JSON.stringify(next, null, 2) + '\n');
+    let binary = ''; for (const byte of encoded) binary += String.fromCharCode(byte);
+    await api(`${endpoint}/contents/posts.json`, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({message: `删除文章：${title}`, content: btoa(binary), sha: file.sha, branch: BRANCH})});
+    await refreshPosts(); status('文章已删除。网站部署通常需要几分钟。');
+  } catch (error) { status(`${error.message}，未完成删除。`); }
+  finally { busy = false; controls(); }
+}
+$('logout').addEventListener('click', () => { token = ''; clearCachedToken(); $('token').value = ''; $('logout').hidden = true; $('manage-posts').hidden = true; controls(); status('已退出，当前文字仍保留。'); });
 function draft() {
   const now = new Date();
-  const date = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
+  const date = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}T${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
   return {id: draftId, date, title: $('title').value.trim(), text: $('text').value.trim()};
 }
 function preview() {
@@ -68,3 +101,4 @@ $('editor-form').addEventListener('submit', async event => {
   finally { fields.forEach(el => el.disabled = false); busy = false; controls(); }
 });
 window.addEventListener('beforeunload', event => { if (dirty) { event.preventDefault(); event.returnValue = ''; } });
+try { const cached = sessionStorage.getItem(TOKEN_CACHE); if (cached) { $('token').value = cached; $('login-form').requestSubmit(); } } catch {}
