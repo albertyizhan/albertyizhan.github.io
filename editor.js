@@ -1,104 +1,123 @@
-import {OWNER, REPO, BRANCH, MAX_BYTES, validatePosts, node, renderPost} from './blog.js';
+import {validatePosts, sortPosts} from './posts.js';
+import {node, renderPost} from './render.js';
+import {githubClient} from './github.js';
+
 const $ = id => document.getElementById(id);
-let token = '', draftId = crypto.randomUUID(), busy = false, dirty = false;
 const TOKEN_CACHE = 'liubai-author-token';
-const endpoint = `https://api.github.com/repos/${OWNER}/${REPO}`;
+const DRAFT_CACHE = 'liubai-draft';
+let client = null, busy = false, dirty = false;
+let draftId = crypto.randomUUID(), draftDate = '', saved = false;
 const status = message => { $('status').textContent = message; };
 function controls() {
-  $('publish').disabled = !token || busy;
-  for (const id of ['login-button', 'token', 'logout']) $(id).disabled = busy;
-  $('logout').hidden = !token;
+  for (const el of document.querySelectorAll('input, textarea, button')) el.disabled = busy;
+  $('publish').disabled = !client || busy;
+  $('logout').hidden = !client;
+  $('access-state').textContent = client ? '已验证 · Albert' : '尚未验证';
 }
-function cacheToken() { try { sessionStorage.setItem(TOKEN_CACHE, token); } catch {} }
-function clearCachedToken() { try { sessionStorage.removeItem(TOKEN_CACHE); } catch {} }
-async function api(url, options = {}) {
-  const response = await fetch(url, {...options, headers: {Accept: 'application/vnd.github+json', Authorization: `Bearer ${token}`, 'X-GitHub-Api-Version': '2022-11-28', ...options.headers}, signal: AbortSignal.timeout(30000)});
-  if (!response.ok) {
-    if (response.status === 401) { token = ''; clearCachedToken(); controls(); }
-    throw new Error(response.status === 409 || response.status === 422 ? '文章库已变化，请再次发布；不会覆盖其他更新。' : `GitHub 请求失败（${response.status}），请检查令牌有效期、仓库权限及网络。`);
+function clearToken() { try { sessionStorage.removeItem(TOKEN_CACHE); } catch {} }
+function failure(error) {
+  if (error.status === 401) {
+    client = null; clearToken(); $('manage-posts').hidden = true;
   }
-  return response.json();
+  return error.name === 'TimeoutError' || error.name === 'TypeError'
+    ? '网络未能确认结果，请重试。' : error.message;
 }
-$('login-form').addEventListener('submit', async event => {
-  event.preventDefault(); if (busy) return; token = $('token').value.trim(); $('token').value = ''; busy = true; controls(); $('login-button').disabled = true;
-  try {
-    const user = await api('https://api.github.com/user');
-    if (user.login.toLowerCase() !== OWNER.toLowerCase()) throw new Error('仅允许 Albert 的 GitHub 账户发布。');
-    const repo = await api(endpoint);
-    if (!repo.permissions?.push) throw new Error('此凭证没有本站仓库的写入权限。');
-    cacheToken(); $('logout').hidden = false; status('身份已验证，可以发布你的记录。');
-    await refreshPosts();
-  } catch (error) { token = ''; clearCachedToken(); status(error.message); }
-  finally { busy = false; controls(); $('login-button').disabled = false; }
-});
-async function refreshPosts() {
-  const file = await api(`${endpoint}/contents/posts.json?ref=${encodeURIComponent(BRANCH)}`);
-  const bytes = Uint8Array.from(atob(file.content.replace(/\s/g, '')), c => c.charCodeAt(0));
-  const posts = validatePosts(JSON.parse(new TextDecoder('utf-8', {fatal: true}).decode(bytes)));
-  const manage = $('manage-posts'); manage.hidden = false; manage.replaceChildren();
-  if (!posts.length) { manage.append(node('p', 'field-note', '暂无已发布文章。')); return; }
-  for (const post of posts) {
-    const row = node('div', 'manage-post');
-    row.append(node('span', '', `${post.date.replace('T', ' ')} · ${post.title}`));
-    const button = node('button', 'delete-post', '删除'); button.type = 'button';
-    button.addEventListener('click', () => deletePost(post.id, post.title)); row.append(button); manage.append(row);
-  }
-}
-async function deletePost(id, title) {
-  if (busy || !confirm(`确定删除《${title}》吗？此操作会提交到 GitHub。`)) return;
-  busy = true; controls(); status('正在删除文章……');
-  try {
-    const file = await api(`${endpoint}/contents/posts.json?ref=${encodeURIComponent(BRANCH)}`);
-    const bytes = Uint8Array.from(atob(file.content.replace(/\s/g, '')), c => c.charCodeAt(0));
-    const posts = validatePosts(JSON.parse(new TextDecoder('utf-8', {fatal: true}).decode(bytes)));
-    const next = posts.filter(post => post.id !== id);
-    if (next.length === posts.length) throw new Error('文章已被删除或文章库已变化。');
-    const encoded = new TextEncoder().encode(JSON.stringify(next, null, 2) + '\n');
-    let binary = ''; for (const byte of encoded) binary += String.fromCharCode(byte);
-    await api(`${endpoint}/contents/posts.json`, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({message: `删除文章：${title}`, content: btoa(binary), sha: file.sha, branch: BRANCH})});
-    await refreshPosts(); status('文章已删除。网站部署通常需要几分钟。');
-  } catch (error) { status(`${error.message}，未完成删除。`); }
-  finally { busy = false; controls(); }
-}
-$('logout').addEventListener('click', () => { token = ''; clearCachedToken(); $('token').value = ''; $('logout').hidden = true; $('manage-posts').hidden = true; controls(); status('已退出，当前文字仍保留。'); });
-function draft() {
+function localDate() {
   const now = new Date();
-  const date = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}T${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
-  return {id: draftId, date, title: $('title').value.trim(), text: $('text').value.trim()};
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}T${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+}
+function draft() {
+  return {id: draftId, date: draftDate || localDate(), title: $('title').value.trim(), text: $('text').value.trim()};
+}
+function saveDraft() {
+  dirty = Boolean($('title').value || $('text').value);
+  try {
+    if (dirty) localStorage.setItem(DRAFT_CACHE, JSON.stringify({...draft(), title: $('title').value, text: $('text').value}));
+    else localStorage.removeItem(DRAFT_CACHE);
+    saved = true;
+  } catch { saved = false; }
+  $('draft-state').textContent = dirty ? (saved ? '草稿已保存到此浏览器' : '草稿尚未保存，请勿关闭页面') : '从一句话开始';
 }
 function preview() {
+  $('word-count').textContent = `${$('text').value.length.toLocaleString()} / 20,000`;
+  if (!$('title').value.trim() && !$('text').value.trim()) {
+    $('preview').replaceChildren(node('p', 'empty-note', '文字会在这里慢慢成形。')); return;
+  }
   const p = draft(); p.title ||= '未命名的记录';
   const article = renderPost(p); article.open = true; $('preview').replaceChildren(article);
 }
-for (const id of ['title', 'text']) $(id).addEventListener('input', () => { dirty = true; preview(); });
+function renderManage(posts) {
+  const manage = $('manage-posts'); manage.hidden = false;
+  manage.replaceChildren(node('h2', '', `已发布文章 · ${posts.length}`));
+  if (!posts.length) manage.append(node('p', 'field-note', '暂无已发布文章。'));
+  for (const post of sortPosts(posts)) {
+    const row = node('div', 'manage-post');
+    const link = node('a', '', post.title); link.href = `./#post-${post.id}`;
+    const info = node('div'); info.append(node('time', 'field-note', post.date.replace('T', ' ')), link);
+    const button = node('button', 'delete-post', '删除'); button.type = 'button';
+    button.setAttribute('aria-label', `删除文章：${post.title}`);
+    button.addEventListener('click', () => deletePost(post));
+    row.append(info, button); manage.append(row);
+  }
+}
+async function login(value) {
+  if (busy) return;
+  busy = true; client = null; clearToken(); $('manage-posts').hidden = true; controls(); status('正在验证身份……');
+  try {
+    const candidate = githubClient(value); await candidate.verify();
+    client = candidate;
+    try { sessionStorage.setItem(TOKEN_CACHE, value); } catch {}
+    status('身份已验证，可以发布你的记录。');
+    try { renderManage((await client.read()).posts); }
+    catch (error) { status(`文章列表读取失败：${failure(error)}`); }
+  } catch (error) { status(failure(error)); }
+  finally { busy = false; controls(); }
+}
+$('login-form').addEventListener('submit', event => {
+  event.preventDefault(); const value = $('token').value.trim(); $('token').value = '';
+  if (value) login(value);
+});
+async function deletePost(post) {
+  if (busy || !client || !confirm(`确定删除《${post.title}》吗？此操作会提交到 GitHub。`)) return;
+  busy = true; controls(); status('正在删除文章……');
+  try {
+    renderManage(await client.remove(post.id));
+    status('文章已删除，网站将在部署完成后更新。');
+  } catch (error) { status(`${failure(error)} 删除结果尚未确认，可安全重试。`); }
+  finally { busy = false; controls(); }
+}
+$('logout').addEventListener('click', () => {
+  client = null; clearToken(); $('token').value = ''; $('manage-posts').hidden = true;
+  $('manage-posts').replaceChildren(); controls(); status('已退出，草稿仍保留。');
+});
+for (const id of ['title', 'text']) $(id).addEventListener('input', () => { saveDraft(); preview(); });
+$('new-draft').addEventListener('click', () => {
+  if (dirty && !confirm('开始新稿会清空当前草稿，确定继续吗？')) return;
+  $('editor-form').reset(); draftId = crypto.randomUUID(); draftDate = ''; saveDraft(); preview(); $('title').focus();
+});
 $('editor-form').addEventListener('submit', async event => {
-  event.preventDefault(); if (!token || busy) return;
+  event.preventDefault(); if (!client || busy) return;
+  draftDate ||= localDate();
   const post = draft();
   try { validatePosts([post]); } catch (error) { status(error.message); return; }
-  busy = true; controls();
-  const fields = [...document.querySelectorAll('input, textarea, button')]; fields.forEach(el => el.disabled = true);
-  status('正在保存文章……');
+  saveDraft(); busy = true; controls(); status('正在发布文章……');
   try {
-    // ponytail: one atomic file keeps publishing simple; split articles into files before the text index reaches 700 KB.
-    const file = await api(`${endpoint}/contents/posts.json?ref=${encodeURIComponent(BRANCH)}`);
-    if (!file.content || file.encoding !== 'base64') throw new Error('文章库无法读取，请确认 posts.json 已部署且大小正常。');
-    const bytes = Uint8Array.from(atob(file.content.replace(/\s/g, '')), c => c.charCodeAt(0));
-    const posts = validatePosts(JSON.parse(new TextDecoder('utf-8', {fatal: true}).decode(bytes)));
-    const existing = posts.find(p => p.id === post.id);
-    if (existing && JSON.stringify(existing) !== JSON.stringify(post)) {
-      draftId = crypto.randomUUID();
-      throw new Error('上一版草稿已经发布。本次修改仍保留；再次点击将作为新文章发布。');
-    }
-    if (!existing) {
-      const encoded = new TextEncoder().encode(JSON.stringify([post, ...posts], null, 2) + '\n');
-      if (encoded.length > MAX_BYTES) throw new Error('文章库已达到当前 700 KB 上限。需要拆分文章存储后再发布；图床图片不计入此容量。');
-      let binary = ''; for (const byte of encoded) binary += String.fromCharCode(byte);
-      await api(`${endpoint}/contents/posts.json`, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({message: `发布文章：${post.title}`, content: btoa(binary), sha: file.sha, branch: BRANCH})});
-    }
-    $('editor-form').reset(); draftId = crypto.randomUUID(); dirty = false; $('preview').replaceChildren(node('p', 'empty-note', '留一点空白，给下一篇记录。'));
-    status('文章已保存到 GitHub。网站部署通常需要几分钟，稍后返回博客查看。');
-  } catch (error) { status(`${error.message} 草稿仍保留；若网络中断，可直接重试，系统会避免重复发布。`); }
-  finally { fields.forEach(el => el.disabled = false); busy = false; controls(); }
+    const posts = await client.publish(post);
+    $('editor-form').reset(); draftId = crypto.randomUUID(); draftDate = ''; saveDraft(); preview(); renderManage(posts);
+    status('文章已保存到 GitHub，网站将在部署完成后更新。');
+  } catch (error) { status(`${failure(error)} 草稿仍保留，重试不会重复发布。`); }
+  finally { busy = false; controls(); }
 });
-window.addEventListener('beforeunload', event => { if (dirty) { event.preventDefault(); event.returnValue = ''; } });
-try { const cached = sessionStorage.getItem(TOKEN_CACHE); if (cached) { $('token').value = cached; $('login-form').requestSubmit(); } } catch {}
+window.addEventListener('beforeunload', event => {
+  if (busy || (dirty && !saved)) { event.preventDefault(); event.returnValue = ''; }
+});
+try {
+  const cached = JSON.parse(localStorage.getItem(DRAFT_CACHE));
+  if (cached) {
+    validatePosts([{...cached, title: cached.title.trim() || '草稿', text: cached.text.trim() || '草稿'}]);
+    draftId = cached.id; draftDate = cached.date; $('title').value = cached.title; $('text').value = cached.text;
+    saveDraft(); preview();
+  }
+} catch { $('draft-state').textContent = '本地草稿无法恢复'; }
+controls();
+try { const cached = sessionStorage.getItem(TOKEN_CACHE); if (cached) login(cached); } catch {}
